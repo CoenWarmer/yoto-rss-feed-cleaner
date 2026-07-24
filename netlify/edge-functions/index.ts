@@ -1,58 +1,52 @@
 /**
- * yoto-feed-cleaner (Netlify Edge Function) — v2, full audio proxy
- * ------------------------------------------------------------------
- * v1 tried to resolve each enclosure's redirect chain and rewrite the
- * feed to point straight at the final URL. That failed for NPO's feed
- * because:
- *   1. The redirect only happens on GET, not HEAD, so v1's detection
- *      (HEAD-first) never even saw it.
- *   2. The actual redirect target isn't a short-lived tracking wrapper
- *      — it's a cross-domain redirect (podcast.npo.nl -> a
- *      *.cdn.streamgate.nl host) carrying a long opaque JWT directly in
- *      the URL path. Even if resolved correctly, handing Yoto that
- *      final URL still means it has to follow a redirect to an unusual,
- *      long, foreign-domain URL — plausibly the actual thing its
- *      embedded HTTP client chokes on, not the redirect hop count.
+ * yoto-feed-cleaner (Netlify Edge Function) — v3, buffer-then-serve
+ * ---------------------------------------------------------------------
+ * v2 fully proxied audio live (upstream -> client, streamed). That may
+ * still have been getting cut short around 45s into playback — possibly
+ * NPO's CDN truncating "unrecognized" live connections, possibly
+ * something about the long-lived streaming connection itself. v3 removes
+ * that variable entirely: on first request for an episode, we download
+ * the ENTIRE file server-side into memory, cache the raw bytes (+
+ * content-type) in Netlify Blobs, and serve every request — this one and
+ * all future ones, including Range requests — directly from that cached
+ * copy. Yoto now always talks to a fully-buffered, locally-served file
+ * with no live upstream connection involved in the response path at all.
  *
- * v2 sidesteps the whole question of "what exactly is too complex for
- * Yoto's client" by making sure Yoto never sees the origin URL, the
- * redirect, or the CDN's JWT URL at all:
+ * Trade-off: the first request for each episode has to wait for the full
+ * download to complete before any bytes go back to Yoto (no time-to-
+ * first-byte streaming head start). For typical podcast-episode file
+ * sizes this should still land well within Netlify's 40-second
+ * response-header timeout, but very large files could be a problem —
+ * see MAX_BUFFER_BYTES below.
  *
- *   - The rewritten feed points each episode at a short path on THIS
- *     domain: /a/<12-char-hash>
- *   - Netlify Blobs stores the hash -> real original URL mapping
- *     (written whenever the feed itself is fetched/regenerated)
- *   - When Yoto requests /a/<hash>, this function looks up the real
- *     URL, does a normal GET with redirect:"follow" (fully resolving
- *     the npo.nl -> streamgate.nl hop server-side), and streams the
- *     resulting audio bytes straight back under a plain 200 response.
+ * File location: wherever your `config.path` routes already point
+ * (e.g. repo-root/index.ts per your current setup, or
+ * netlify/edge-functions/<name>.ts).
  *
- * Yoto only ever talks to one short, flat, single-hop URL on our own
- * domain — no redirects, no query strings, no foreign hosts.
- *
- * File location: netlify/edge-functions/yoto-feed-cleaner.ts (or
- * whatever filename — this one lives at repo-root/index.ts per your
- * current setup, matching the `config.path` values below regardless of
- * filename).
- *
- * Dependency: @netlify/blobs. If the "npm:@netlify/blobs" specifier
- * below doesn't resolve in your Netlify build, try
- * "https://esm.sh/@netlify/blobs" instead — Netlify's Deno-based Edge
- * Function runtime supports both import styles, but which one is
- * required has shifted with tooling versions, so worth checking Netlify's
- * current Edge Functions + npm imports docs if this errors on deploy.
+ * Dependency: @netlify/blobs. If "npm:@netlify/blobs" doesn't resolve in
+ * your Netlify build, try "https://esm.sh/@netlify/blobs" instead.
  *
  * Usage:
  *   Feed:  https://<your-site>.netlify.app/yoto-feed-cleaner?feed=<url-encoded feed>
  *   Debug: same, with &debug=1
  */
 
-import { getStore } from "https://esm.sh/@netlify/blobs";
+import { getStore } from "npm:@netlify/blobs";
 
 const FEED_CACHE_TTL_SECONDS = 60 * 60;
 const FEED_FETCH_TIMEOUT_MS = 8000;
-const AUDIO_FETCH_TIMEOUT_MS = 30000;
-const STORE_NAME = "yoto-feed-cleaner-urls";
+const AUDIO_FETCH_TIMEOUT_MS = 35000; // must comfortably clear Netlify's 40s header timeout
+const MAX_BUFFER_BYTES = 150 * 1024 * 1024; // ~150MB safety cap; refuse to buffer anything larger
+const URL_STORE_NAME = "yoto-feed-cleaner-urls";
+const AUDIO_STORE_NAME = "yoto-feed-cleaner-audio";
+
+const UPSTREAM_HEADERS = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36",
+  "Referer": "https://podcast.npo.nl/",
+  "Origin": "https://podcast.npo.nl",
+  "Accept": "audio/mpeg, audio/*;q=0.9, */*;q=0.8",
+};
 
 export const config = { path: ["/yoto-feed-cleaner", "/a/*"] };
 
@@ -114,17 +108,14 @@ async function handleFeed(incoming: URL): Promise<Response> {
 
 async function rewriteEnclosuresToProxy(xml: string, origin: string): Promise<string> {
   const originalUrls = extractEnclosureUrls(xml);
-  const store = getStore({ name: STORE_NAME, consistency: "strong" });
+  const urlStore = getStore({ name: URL_STORE_NAME, consistency: "strong" });
 
   const idFor = new Map<string, string>();
   await Promise.all(
     [...originalUrls].map(async (original) => {
       const id = await shortId(original);
       idFor.set(original, id);
-      // Idempotent write — keeps the mapping fresh if an episode's
-      // underlying URL ever changes, and cheap enough to do every time
-      // the feed is fetched.
-      await store.set(id, original);
+      await urlStore.set(id, original);
     })
   );
 
@@ -139,23 +130,25 @@ async function rewriteEnclosuresToProxy(xml: string, origin: string): Promise<st
 
 async function debugReport(xml: string, origin: string) {
   const originalUrls = [...extractEnclosureUrls(xml)];
-  const store = getStore({ name: STORE_NAME, consistency: "strong" });
+  const urlStore = getStore({ name: URL_STORE_NAME, consistency: "strong" });
 
   const sample = await Promise.all(
     originalUrls.slice(0, 5).map(async (original) => {
       const id = await shortId(original);
-      await store.set(id, original);
+      await urlStore.set(id, original);
       const proxyUrl = `${origin}/a/${id}`;
-      const entry: Record<string, unknown> = { original, id, proxyUrl, proxyUrlLength: proxyUrl.length };
+      const entry: Record<string, unknown> = { original, id, proxyUrl };
       try {
         const resolved = await fetchWithTimeout(
           original,
-          { method: "GET", redirect: "follow", headers: { Range: "bytes=0-0" } },
+          { method: "GET", redirect: "follow", headers: { ...UPSTREAM_HEADERS, Range: "bytes=0-0" } },
           FEED_FETCH_TIMEOUT_MS
         );
         entry.resolvedStatus = resolved.status;
         entry.resolvedFinalUrl = resolved.url;
         entry.resolvedContentType = resolved.headers.get("content-type");
+        entry.resolvedContentLength = resolved.headers.get("content-length");
+        entry.resolvedContentRange = resolved.headers.get("content-range");
       } catch (err) {
         entry.resolveError = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
       }
@@ -170,8 +163,20 @@ async function handleAudioProxy(incoming: URL, request: Request): Promise<Respon
   const id = incoming.pathname.replace(/^\/a\//, "");
   if (!id) return new Response("Missing id", { status: 400 });
 
-  const store = getStore({ name: STORE_NAME, consistency: "strong" });
-  const target = await store.get(id);
+  const audioStore = getStore({ name: AUDIO_STORE_NAME, consistency: "strong" });
+
+  // Already cached? Serve straight from Blobs — no upstream involved.
+  const cachedMeta = await audioStore.getMetadata(id).catch(() => null);
+  if (cachedMeta) {
+    const bytes = await audioStore.get(id, { type: "arrayBuffer" });
+    if (bytes) {
+      return serveBuffer(bytes as ArrayBuffer, cachedMeta.metadata?.contentType as string | undefined, request);
+    }
+  }
+
+  // Not cached yet — resolve the real URL, download the FULL file, cache it.
+  const urlStore = getStore({ name: URL_STORE_NAME, consistency: "strong" });
+  const target = await urlStore.get(id);
   if (!target) {
     return new Response(
       "Unknown episode id (feed may not have been fetched recently) — request the feed URL again first.",
@@ -179,21 +184,13 @@ async function handleAudioProxy(incoming: URL, request: Request): Promise<Respon
     );
   }
 
-  const forwardHeaders: Record<string, string> = {
-    "User-Agent": "Mozilla/5.0 (compatible; YotoFeedCleaner/1.0)",
-  };
-  const range = request.headers.get("range");
-  if (range) forwardHeaders["Range"] = range;
-
   let upstream: Response;
   try {
+    // Deliberately no Range header here — we always want the whole file
+    // on this first fetch, regardless of what Yoto's request asked for.
     upstream = await fetchWithTimeout(
       target,
-      {
-        method: request.method === "HEAD" ? "HEAD" : "GET",
-        redirect: "follow",
-        headers: forwardHeaders,
-      },
+      { method: "GET", redirect: "follow", headers: UPSTREAM_HEADERS },
       AUDIO_FETCH_TIMEOUT_MS
     );
   } catch (err) {
@@ -203,14 +200,70 @@ async function handleAudioProxy(incoming: URL, request: Request): Promise<Respon
     );
   }
 
-  const respHeaders = new Headers();
-  for (const h of ["content-type", "content-length", "accept-ranges", "content-range", "etag", "last-modified"]) {
-    const v = upstream.headers.get(h);
-    if (v) respHeaders.set(h, v);
+  if (!upstream.ok) {
+    return new Response(`Upstream audio fetch failed: ${upstream.status}`, { status: 502 });
   }
-  respHeaders.set("cache-control", "public, max-age=86400");
 
-  return new Response(upstream.body, { status: upstream.status, headers: respHeaders });
+  const declaredLength = Number(upstream.headers.get("content-length") ?? "0");
+  if (declaredLength && declaredLength > MAX_BUFFER_BYTES) {
+    return new Response(
+      `Upstream file too large to buffer (${declaredLength} bytes > ${MAX_BUFFER_BYTES} limit)`,
+      { status: 502 }
+    );
+  }
+
+  let buffer: ArrayBuffer;
+  try {
+    buffer = await upstream.arrayBuffer();
+  } catch (err) {
+    return new Response(
+      `Failed reading upstream audio body: ${err instanceof Error ? err.message : String(err)}`,
+      { status: 502 }
+    );
+  }
+
+  if (buffer.byteLength > MAX_BUFFER_BYTES) {
+    return new Response(
+      `Downloaded file too large to cache (${buffer.byteLength} bytes > ${MAX_BUFFER_BYTES} limit)`,
+      { status: 502 }
+    );
+  }
+
+  const contentType = upstream.headers.get("content-type") ?? "audio/mpeg";
+
+  // Cache for next time (including any Range sub-requests Yoto makes).
+  await audioStore.set(id, buffer, { metadata: { contentType } });
+
+  return serveBuffer(buffer, contentType, request);
+}
+
+function serveBuffer(buffer: ArrayBuffer, contentType: string | undefined, request: Request): Response {
+  const total = buffer.byteLength;
+  const rangeHeader = request.headers.get("range");
+  const headers = new Headers({
+    "content-type": contentType ?? "audio/mpeg",
+    "accept-ranges": "bytes",
+    "cache-control": "public, max-age=86400",
+  });
+
+  if (rangeHeader) {
+    const match = /^bytes=(\d*)-(\d*)$/.exec(rangeHeader);
+    if (match) {
+      const start = match[1] === "" ? 0 : parseInt(match[1], 10);
+      const end = match[2] === "" ? total - 1 : Math.min(parseInt(match[2], 10), total - 1);
+      if (start <= end && start < total) {
+        const slice = buffer.slice(start, end + 1);
+        headers.set("content-range", `bytes ${start}-${end}/${total}`);
+        headers.set("content-length", String(slice.byteLength));
+        return new Response(slice, { status: 206, headers });
+      }
+      headers.set("content-range", `bytes */${total}`);
+      return new Response(null, { status: 416, headers });
+    }
+  }
+
+  headers.set("content-length", String(total));
+  return new Response(buffer, { status: 200, headers });
 }
 
 function extractEnclosureUrls(xml: string): Set<string> {
@@ -228,7 +281,7 @@ async function shortId(input: string): Promise<string> {
   const bytes = new Uint8Array(digest);
   let hex = "";
   for (let i = 0; i < 6; i++) hex += bytes[i].toString(16).padStart(2, "0");
-  return hex; // 12 hex chars — short, stable per source URL
+  return hex;
 }
 
 async function fetchWithTimeout(
