@@ -81,10 +81,10 @@ export default async (request: Request): Promise<Response> => {
 export const config = { path: "/yoto-feed-cleaner" };
 
 async function rewriteEnclosures(xml: string): Promise<string> {
-  const enclosureRegex = /<enclosure\b[^>]*\burl="([^"]+)"[^>]*\/?>/g;
+  const enclosureRegex = /(<enclosure\b[^>]*\burl=")([^"]+)("[^>]*\/?>)/g;
   const originalUrls = new Set<string>();
   for (const m of xml.matchAll(enclosureRegex)) {
-    originalUrls.add(decodeXmlEntities(m[1]));
+    originalUrls.add(decodeXmlEntities(m[2]));
   }
 
   const resolved = new Map<string, string>();
@@ -100,11 +100,11 @@ async function rewriteEnclosures(xml: string): Promise<string> {
     })
   );
 
-  return xml.replace(enclosureRegex, (tag, rawUrl) => {
+  return xml.replace(enclosureRegex, (_, prefix, rawUrl, suffix) => {
     const original = decodeXmlEntities(rawUrl);
     const final = resolved.get(original);
-    if (!final || final === original) return tag;
-    return tag.replace(/(\burl=")[^"]+(")/, `$1${encodeXmlEntities(final)}$2`);
+    if (!final || final === original) return `${prefix}${rawUrl}${suffix}`;
+    return `${prefix}${encodeXmlEntities(final)}${suffix}`;
   });
 }
 
@@ -134,7 +134,7 @@ async function fetchWithTimeout(url: string, init: RequestInit = {}): Promise<Re
 }
 
 function decodeXmlEntities(s: string): string {
-  return s.replace(/&(#\d+|#x[0-9a-fA-F]+|amp|lt|gt|quot|apos);/g, (_, value: string) => {
+  return s.replace(/&(#\d+|#x[0-9a-fA-F]+|amp|lt|gt|quot|apos);/g, (entity, value: string) => {
     switch (value) {
       case "amp":
         return "&";
@@ -153,7 +153,7 @@ function decodeXmlEntities(s: string): string {
         if (value.startsWith("#")) {
           return decodeNumericEntity(value, 10);
         }
-        return `&${value}`;
+        return entity;
     }
   });
 }
