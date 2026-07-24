@@ -66,6 +66,14 @@ export default async (request: Request): Promise<Response> => {
   }
 
   const xml = await originResp.text();
+
+  if (incoming.searchParams.get("debug") === "1") {
+    const report = await debugResolveEnclosures(xml);
+    return new Response(JSON.stringify(report, null, 2), {
+      headers: { "content-type": "application/json; charset=utf-8" },
+    });
+  }
+
   const cleaned = await rewriteEnclosures(xml);
 
   return new Response(cleaned, {
@@ -77,6 +85,53 @@ export default async (request: Request): Promise<Response> => {
     },
   });
 };
+
+/**
+ * Diagnostic mode: for each unique enclosure URL in the feed, report the
+ * original URL, what we resolved it to (if anything), how many redirect
+ * hops that involved, and any error encountered — instead of silently
+ * falling back to the original URL on failure like rewriteEnclosures does.
+ * Hit with &debug=1 to see this instead of the rewritten feed.
+ */
+async function debugResolveEnclosures(xml: string) {
+  const enclosureRegex = /<enclosure\b[^>]*\burl="([^"]+)"[^>]*\/?>/g;
+  const originalUrls = new Set<string>();
+  for (const m of xml.matchAll(enclosureRegex)) {
+    originalUrls.add(decodeXmlEntities(m[1]));
+  }
+
+  const results = await Promise.all(
+    [...originalUrls].slice(0, 5).map(async (original) => {
+      const entry: Record<string, unknown> = { original };
+      try {
+        const head = await fetchWithTimeout(original, { method: "HEAD", redirect: "follow" });
+        entry.headStatus = head.status;
+        entry.headOk = head.ok;
+        entry.headFinalUrl = head.url;
+        if (!head.ok && head.status !== 405) {
+          const ranged = await fetchWithTimeout(original, {
+            method: "GET",
+            redirect: "follow",
+            headers: { Range: "bytes=0-0" },
+          });
+          entry.rangedGetStatus = ranged.status;
+          entry.rangedGetOk = ranged.ok;
+          entry.rangedGetFinalUrl = ranged.url;
+        }
+      } catch (err) {
+        entry.error = err instanceof Error ? `${err.name}: ${err.message}` : String(err);
+      }
+      return entry;
+    })
+  );
+
+  return {
+    enclosureCount: originalUrls.size,
+    // Only the first 5 are resolved above to keep this fast; enclosureCount
+    // tells you if there were more.
+    sample: results,
+  };
+}
 
 export const config = { path: "/yoto-feed-cleaner" };
 
