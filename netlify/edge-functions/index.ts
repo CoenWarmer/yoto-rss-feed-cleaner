@@ -17,7 +17,7 @@
  * Function responses.
  *
  * File location matters: this must live at
- *   netlify/edge-functions/yoto-feed-cleaner.ts
+ *   netlify/edge-functions/index.ts
  * The `config` export below registers its path automatically — no
  * netlify.toml edits required.
  *
@@ -30,7 +30,7 @@
  * Deploy:
  *   npm install -g netlify-cli
  *   netlify login
- *   # from your site's root, with this file at netlify/edge-functions/yoto-feed-cleaner.ts
+ *   # from your site's root, with this file at netlify/edge-functions/index.ts
  *   netlify deploy --prod
  */
 
