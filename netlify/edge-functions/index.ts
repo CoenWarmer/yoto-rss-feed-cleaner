@@ -47,7 +47,7 @@
  *   Debug: same, with &debug=1
  */
 
-import { getStore } from "npm:@netlify/blobs";
+import { getStore } from "https://esm.sh/@netlify/blobs";
 
 const FEED_CACHE_TTL_SECONDS = 60 * 60;
 const FEED_FETCH_TIMEOUT_MS = 8000;
