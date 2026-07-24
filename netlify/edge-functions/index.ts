@@ -104,7 +104,7 @@ async function rewriteEnclosures(xml: string): Promise<string> {
     const original = decodeXmlEntities(rawUrl);
     const final = resolved.get(original);
     if (!final || final === original) return tag;
-    return tag.replace(rawUrl, encodeXmlEntities(final));
+    return tag.replace(/(\burl=")[^"]+(")/, `$1${encodeXmlEntities(final)}$2`);
   });
 }
 
@@ -134,7 +134,7 @@ async function fetchWithTimeout(url: string, init: RequestInit = {}): Promise<Re
 }
 
 function decodeXmlEntities(s: string): string {
-  return s.replace(/&(#\d+|#x[0-9a-fA-F]+|amp|lt|gt|quot|apos);?/g, (_, value: string) => {
+  return s.replace(/&(#\d+|#x[0-9a-fA-F]+|amp|lt|gt|quot|apos);/g, (_, value: string) => {
     switch (value) {
       case "amp":
         return "&";
