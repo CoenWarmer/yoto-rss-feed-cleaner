@@ -100,14 +100,12 @@ async function rewriteEnclosures(xml: string): Promise<string> {
     })
   );
 
-  let out = xml;
-  for (const [original, final] of resolved) {
-    if (final === original) continue;
-    const encodedOriginal = encodeXmlEntities(original);
-    const encodedFinal = encodeXmlEntities(final);
-    out = out.split(`url="${encodedOriginal}"`).join(`url="${encodedFinal}"`);
-  }
-  return out;
+  return xml.replace(enclosureRegex, (tag, rawUrl) => {
+    const original = decodeXmlEntities(rawUrl);
+    const final = resolved.get(original);
+    if (!final || final === original) return tag;
+    return tag.replace(rawUrl, encodeXmlEntities(final));
+  });
 }
 
 async function resolveFinalUrl(url: string): Promise<string> {
@@ -136,20 +134,26 @@ async function fetchWithTimeout(url: string, init: RequestInit = {}): Promise<Re
 }
 
 function decodeXmlEntities(s: string): string {
-  return s.replace(/&(amp|lt|gt|quot|#39);/g, (entity) => {
-    switch (entity) {
-      case "&amp;":
+  return s.replace(/&(#\d+|#x[0-9a-fA-F]+|amp|lt|gt|quot|apos);?/g, (_, value: string) => {
+    switch (value) {
+      case "amp":
         return "&";
-      case "&lt;":
+      case "lt":
         return "<";
-      case "&gt;":
+      case "gt":
         return ">";
-      case "&quot;":
+      case "quot":
         return '"';
-      case "&#39;":
+      case "apos":
         return "'";
       default:
-        return entity;
+        if (value.startsWith("#x")) {
+          return decodeNumericEntity(value, 16);
+        }
+        if (value.startsWith("#")) {
+          return decodeNumericEntity(value, 10);
+        }
+        return `&${value}`;
     }
   });
 }
@@ -161,4 +165,13 @@ function encodeXmlEntities(s: string): string {
     .replace(/>/g, "&gt;")
     .replace(/"/g, "&quot;")
     .replace(/'/g, "&#39;");
+}
+
+function decodeNumericEntity(value: string, radix: 10 | 16): string {
+  const digits = radix === 16 ? value.slice(2) : value.slice(1);
+  const codePoint = Number.parseInt(digits, radix);
+  if (!Number.isFinite(codePoint) || codePoint < 0 || codePoint > 0x10ffff) {
+    return `&${value}`;
+  }
+  return String.fromCodePoint(codePoint);
 }
